@@ -1,3 +1,4 @@
+import logging.handlers
 import numpy as np
 import roboticstoolbox as rtb
 import spatialmath as sm
@@ -10,10 +11,13 @@ import heapq
 import os
 import matplotlib.pyplot as plt
 import logging
+import pickle
+
 
 # TODO: Parallelize map generation
 
 
+logger = logging.getLogger('PRM')
 
 
 @dataclass
@@ -54,7 +58,7 @@ def create_nodes(robot: rtb.Robot, obstacles: List[sg.CollisionShape], n_nodes: 
             nodes.append(node)
             i += 1
         if i % 100 == 0:
-            logging.debug(f'Generated {i} nodes')
+            logger.info(f'Generated {i} nodes')
     return nodes
 
 
@@ -65,11 +69,22 @@ def distance_function(node_1: Node, node_2: Node):
     return np.dot(q_diff, q_diff) + np.dot(cartesian_diff, cartesian_diff)
 
 
+def has_collision_along_linear_path(robot: rtb.Robot, obstacles: List[sg.CollisionShape], q1: List[float], q2: List[float]) -> bool:
+    # TODO: incrementally subdivide path for faster collision checking
+    n_steps = 10
+    for i in range(n_steps):
+        alpha = i / (n_steps - 1)
+        q = alpha * np.array(q1) + (1 - alpha) * np.array(q2)
+        for obstacle in obstacles:
+            if robot.iscollided(q, obstacle):
+                return True
+    return False
+
 def find_neighbours(nodes: List[Node], robot: rtb.Robot, obstacles: List[sg.CollisionShape], k_neighbours=10):
     if not isinstance(obstacles, list):
         obstacles = [obstacles]
     
-    logging.debug('Performing K-nearest neighbours search')
+    logger.info('Performing K-nearest neighbours search')
     distances = np.zeros((len(nodes), len(nodes)))
     for i, node_1 in enumerate(nodes):
         for j, node_2 in enumerate(nodes):
@@ -81,27 +96,16 @@ def find_neighbours(nodes: List[Node], robot: rtb.Robot, obstacles: List[sg.Coll
     nbrs.fit(distances)
     _, indices = nbrs.kneighbors(distances)
 
-    def has_collision_along_linear_path(node_1: Node, node_2: Node) -> bool:
-        # TODO: incrementally subdivide path for faster collision checking
-        n_steps = 10
-        for i in range(n_steps):
-            alpha = i / (n_steps - 1)
-            q = alpha * node_1.q + (1 - alpha) * node_2.q
-            for obstacle in obstacles:
-                if robot.iscollided(q, obstacle):
-                    return True
-        return False
-
     # TODO: pre-allocate memory
     edges = []
     for i, neighbors in enumerate(indices):
         for neighbor in neighbors[1:]:
             node_1 = nodes[i]
             node_2 = nodes[neighbor]        
-            if not has_collision_along_linear_path(node_1, node_2):
+            if not has_collision_along_linear_path(robot, obstacles, node_1.q, node_2.q):
                 edges.append((node_1, node_2))
         if i % 100 == 0:
-            logging.debug(f'Found neighbours for {i} nodes')
+            logger.info(f'Found neighbours for {i} nodes')
     return edges
 
 
@@ -170,6 +174,72 @@ def find_path_dijkstra(start_node: Node, goal_node: Node, graph) -> List[Node]:
     return None
 
 
+def find_closest_node(q_start: List[float], nodes: List[Node], robot: rtb.Robot, obstacles: List[sg.CollisionShape]) -> Node:
+    """
+    Find the closest node to the given joint position q_start in the PRM graph.
+    Ensure that the path to the closest node is free of obstacles.
+    """
+    logger.info("Searching for the closest node to the arbitrary start position.")
+
+    # Create a NearestNeighbors model for finding the closest node
+    node_positions = np.array([node.q for node in nodes])
+    nbrs = NearestNeighbors(n_neighbors=1, algorithm='auto')
+    nbrs.fit(node_positions)
+
+    # Find the closest node
+    _, indices = nbrs.kneighbors([q_start])
+    closest_node = nodes[indices[0][0]]
+
+    # Check if the path from q_start to the closest node is collision-free
+    if not has_collision_along_linear_path(robot, obstacles, q_start, closest_node.q):
+        logger.info(f"Found a collision-free path to the closest node: {closest_node}")
+        return closest_node
+    else:
+        logger.info("No collision-free path to the closest node found. Searching for the next closest node.")
+        # If the path is obstructed, search the next closest node
+        for distance, idx in zip(*nbrs.kneighbors([q_start], len(nodes))):
+            candidate_node = nodes[idx]
+            if not has_collision_along_linear_path(robot, obstacles, q_start, candidate_node.q):
+                logger.info(f"Found a collision-free path to node: {candidate_node}")
+                return candidate_node
+
+    # If no valid node is found, raise an exception
+    raise RuntimeError("No collision-free path to any PRM node found.")
+
+
+def add_temporary_node(
+    q0: List[float],
+    graph: dict,
+    nodes: List[Node],
+    robot: rtb.Robot,
+    obstacles: List[sg.CollisionShape],
+    k_neighbours: int
+) -> Node:
+    logger.info("Adding temporary start node and connecting to k nearest neighbors.")
+
+    # Create the temporary start node
+    start_node = Node(q=q0, ee_pose=robot.fkine(q0))
+
+    # Find k nearest neighbors to the start configuration q0
+    k_nearest_neighbors = NearestNeighbors(n_neighbors=k_neighbours).fit([node.q for node in nodes])
+    distances, indices = k_nearest_neighbors.kneighbors([q0])
+
+    # Add the temporary start node to the graph
+    graph[start_node] = []
+    for idx in indices[0]:
+        neighbor_node = nodes[idx]
+        # Check for collision-free path
+        if not has_collision_along_linear_path(robot, obstacles, start_node.q, neighbor_node.q):
+            graph[start_node].append(neighbor_node)
+            graph[neighbor_node].append(start_node)
+
+    logger.info(f"Temporary start node connected to {len(graph[start_node])} neighbors.")
+    
+    return start_node
+
+
+
+
 
 
 ##########################################
@@ -190,7 +260,7 @@ def plot_path(nodes: List[Node], edges, path=None):
     for edge in edges:
         q1_start, q2_start = edge[0].q[0], edge[0].q[1]
         q1_end, q2_end = edge[1].q[0], edge[1].q[1]
-        plt.plot([q1_start, q1_end], [q2_start, q2_end], 'k-', alpha=0.5)  # Plotting edges in joint space
+        plt.plot([q1_start, q1_end], [q2_start, q2_end], 'k-', alpha=0.5)
     
     # Plot path if it exists
     if path is not None:
@@ -211,6 +281,9 @@ def simulate_path(robot: rtb.Robot, path: List[Node], obstacles):
         obstacles = [obstacles]
     env = swift.Swift()
     env.launch(realtime=True)
+    logging.getLogger('websockets').setLevel(logging.WARNING)
+    logging.getLogger('websockets.server').setLevel(logging.WARNING)
+        
     env.add(robot)
     for obstacle in obstacles:
         env.add(obstacle)
@@ -227,14 +300,33 @@ def simulate_path(robot: rtb.Robot, path: List[Node], obstacles):
 
 
 
+def save_graph_and_nodes(filename: str, graph: dict, nodes: List[Node]):
+    """Save the graph and nodes to a file using pickle."""
+    with open(filename, 'wb') as f:
+        pickle.dump((graph, nodes), f)
+    logger.info(f"Saved to {filename}")
+
+def load_graph_and_nodes(filename: str) -> Tuple[dict, List[Node]]:
+    """Load the graph and nodes from a file using pickle."""
+    with open(filename, 'rb') as f:
+        graph, nodes = pickle.load(f)
+    logger.info(f"Loaded from {filename}")
+    return graph, nodes
+
+
+
 ##########################################
 # EXAMPLE
 ##########################################
 if __name__ == '__main__':
     import time
     
-    format = "%(asctime)s: %(message)s"
-    logging.basicConfig(level=logging.DEBUG, format=format)
+    # Also show the logger name in the output
+    format = '%(name)s - %(levelname)s - %(message)s'
+    logging.basicConfig(level=logging.INFO, format=format)
+    logger.setLevel(logging.INFO)
+
+
 
     # this_file_path = os.path.dirname(os.path.realpath(__file__))
     # robot = rtb.Robot.URDF(f'{this_file_path}/robots/acrobot.urdf')
@@ -246,22 +338,28 @@ if __name__ == '__main__':
     obstacles.append(sg.Sphere(0.2, pose = sm.SE3(-0.3, 0.3, 0.5)))
 
 
-    N_NODES = 100
-    K_NEIGHBOURS = 5
+    N_NODES = 500
+    K_NEIGHBOURS = 10
 
     start_time = time.perf_counter()
     graph, nodes, edges = create_prm_graph(robot, obstacles, N_NODES, K_NEIGHBOURS)
-    logging.debug(f'Graph creation took {time.perf_counter() - start_time:.2f} seconds')
+    logger.info(f'Graph creation took {time.perf_counter() - start_time:.2f} seconds')
+    save_graph_and_nodes('prm_map.pkl', graph, nodes)  
+      
+    graph, nodes = load_graph_and_nodes('prm_map.pkl')
     
-    start = nodes[np.random.randint(0, len(nodes))]  
-    goal = nodes[np.random.randint(0, len(nodes))]
     start_time = time.perf_counter()
-    path = find_path_dijkstra(start, goal, graph)
-    logging.debug(f'Path finding took {time.perf_counter() - start_time:.2f} seconds')
+    q0 = [0] * robot.n    
+    qf = robot.qlim[0, :] + np.random.rand(robot.n) * (robot.qlim[1, :] - robot.qlim[0, :])
+    start_node = add_temporary_node(q0, graph, nodes, robot, obstacles, 10)
+    goal_node = add_temporary_node(qf, graph, nodes, robot, obstacles, 10)
+    path = find_path_dijkstra(start_node, goal_node, graph)
+    
+    logger.info(f'Path finding took {time.perf_counter() - start_time:.2f} seconds')
     if path is None:
-        logging.debug('No path found!')
+        logger.info('No path found!')
         exit()
-    logging.debug(f'Path length: {len(path)}')
+    logger.info(f'Path length: {len(path)}')
     
     # plot_path(nodes, edges, path)
     simulate_path(robot, path, obstacles)
