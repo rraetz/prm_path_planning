@@ -199,7 +199,7 @@ def distance_function(node_1: Node, node_2: Node):
     You can experiment with different distance metrics here.
     """
     JOINT_WEIGHT = 1
-    POSE_WEIGHT = 0
+    POSE_WEIGHT = 10
     theta, axis = node_1.ee_pose.angvec(node_2.ee_pose)
     omega = theta * axis
     t = node_1.ee_pose.t - node_2.ee_pose.t
@@ -289,7 +289,7 @@ def add_temporary_node(
     return node
 
 
-def plot_path(graph: dict, path: List[Node]=None):
+def plot_path(graph: dict, path: List[Node]=None, save_to_file: str=None):
     """
     Plot the nodes, edges, and path in the configuration space.
     ONLY FOR 2 DOF ROBOTS!
@@ -326,10 +326,16 @@ def plot_path(graph: dict, path: List[Node]=None):
     plt.ylabel('q2')
     plt.title('Nodes, edges, and path in configuration space')
     plt.legend()
+    if save_to_file is not None:
+        plt.savefig(save_to_file)
     plt.show()
 
 
-def simulate_path(robot: rtb.Robot, path: List[Node], obstacles, graph: dict = None):
+def simulate_path(
+    robot: rtb.Robot, 
+    path: List[Node], 
+    obstacles: List[sg.CollisionShape], 
+    graph: dict = None):
     """
     Simulate the robot moving along the path in the environment.
     """
@@ -349,7 +355,7 @@ def simulate_path(robot: rtb.Robot, path: List[Node], obstacles, graph: dict = N
         nodes: List[Node] = list(graph.keys())
         for node in nodes:
             env.add(sg.Sphere(0.01, color='red', pose=node.ee_pose))
-            
+                        
     STEP_SIZE = 0.1
     for i in range(len(path)-1):
         start = path[i].q
@@ -396,7 +402,7 @@ if __name__ == '__main__':
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='PRM Path Planning Example')
-    parser.add_argument('--n_nodes', type=int, default=500, help='Number of nodes to generate')
+    parser.add_argument('--n_nodes', type=int, default=1000, help='Number of nodes to generate')
     parser.add_argument('--k_neighbours', type=int, default=5, help='Number of neighbors to connect')
     parser.add_argument('--robot', type=str, default='kinova_gen3', help='Robot name', choices=['kinova_gen3', 'planar_2dof'])
     parser.add_argument('--load_from_file', type=str, default=None, help='Load graph from file if provided')
